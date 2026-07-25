@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+dist/
+*.manifest
+*.spec
+
+# Temp files & renders
+ffmpeg/
+temp_dir/
+*.mp4
+*.mp3
+*.wav
+*.avi
+scratch/
+.tempmediaStorage/
+.user_uploaded/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
