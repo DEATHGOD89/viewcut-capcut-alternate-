@@ -4,6 +4,8 @@ import os
 import logging
 from typing import List, Dict
 
+logger = logging.getLogger(__name__)
+
 class FFmpegWrapper:
     def __init__(self, settings: Dict = None):
         self.settings = settings or {}
@@ -82,7 +84,14 @@ class FFmpegWrapper:
             
             if process.returncode != 0:
                 stderr = "".join(error_output)
-                raise RuntimeError(f"FFmpeg command failed: {stderr}")
+                # Full output goes to the log; the raised message drops the
+                # version banner so error dialogs show the ACTUAL error.
+                logger.error(f"FFmpeg command failed: {stderr}")
+                banner = ('ffmpeg version', 'built with', 'configuration:',
+                          'libav', 'libsw', 'libpostproc')
+                informative = [ln for ln in error_output if not ln.strip().startswith(banner)]
+                tail = "".join(informative[-15:]).strip() or "".join(error_output[-10:])
+                raise RuntimeError(f"FFmpeg command failed:\n{tail}")
             if '-y' in cmd:
                 idx = cmd.index('-y')
                 if idx + 1 < len(cmd):
@@ -504,14 +513,16 @@ class FFmpegWrapper:
     def build_delogo(self, input_path: str, output_path: str,
                      x: int, y: int, width: int, height: int,
                      video_width: int = 0, video_height: int = 0) -> List[str]:
+        # FFmpeg's delogo REQUIRES >=1px margin on every side of the rectangle,
+        # otherwise it fails with "Logo area is outside of the frame".
         if video_width > 0 and video_height > 0:
-            x = max(0, min(x, video_width - 2))
-            y = max(0, min(y, video_height - 2))
-            width = max(2, min(width, video_width - x))
-            height = max(2, min(height, video_height - y))
+            x = max(1, min(x, video_width - 3))
+            y = max(1, min(y, video_height - 3))
+            width = max(2, min(width, video_width - x - 1))
+            height = max(2, min(height, video_height - y - 1))
         else:
-            x = max(0, x)
-            y = max(0, y)
+            x = max(1, x)
+            y = max(1, y)
             width = max(2, width)
             height = max(2, height)
 
@@ -546,7 +557,8 @@ class FFmpegWrapper:
                     start: float, end: float,
                     width: int, height: int,
                     fps: int, codec: str, speed: float = 1.0,
-                    volume: float = 1.0, is_muted: bool = False) -> List[str]:
+                    volume: float = 1.0, is_muted: bool = False,
+                    extra_vf: str = "") -> List[str]:
                     
         is_image = input_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))
         
@@ -567,10 +579,14 @@ class FFmpegWrapper:
             if end is not None:
                 cmd.extend(['-to', str(end)])
 
-        if (codec == 'copy' or codec == 'source') and (is_image or start > 0 or (end is not None and end > 0) or width > 0 or height > 0 or speed != 1.0 or volume != 1.0 or is_muted):
+        if (codec == 'copy' or codec == 'source') and (is_image or start > 0 or (end is not None and end > 0) or width > 0 or height > 0 or speed != 1.0 or volume != 1.0 or is_muted or extra_vf):
             codec = 'libx264'
 
         filters = []
+        # extra_vf runs FIRST, at the source resolution — e.g. watermark delogo
+        # whose coordinates were selected on the original (pre-scale) frame.
+        if extra_vf and codec != 'copy' and codec != 'source':
+            filters.append(extra_vf)
         if (codec != 'copy' and codec != 'source') and width > 0 and height > 0:
             filters.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
 
@@ -584,14 +600,13 @@ class FFmpegWrapper:
         if is_muted or volume <= 0.0:
             cmd.extend(['-an'])
         else:
+            af_parts = []
             if speed != 1.0 and speed > 0 and not is_image:
-                if volume != 1.0:
-                    cmd.extend(['-af', f"atempo={speed:.2f},volume={volume:.2f}"])
-                else:
-                    cmd.extend(['-af', f"atempo={speed:.2f}"])
-            else:
-                if volume != 1.0:
-                    cmd.extend(['-af', f"volume={volume:.2f}"])
+                af_parts.append(self._atempo_chain(speed))
+            if volume != 1.0:
+                af_parts.append(f"volume={volume:.2f}")
+            if af_parts:
+                cmd.extend(['-af', ",".join(af_parts)])
 
         threads = str(self.settings.get('threads', 4))
         cmd.extend(['-threads', threads])
@@ -612,12 +627,13 @@ class FFmpegWrapper:
             cmd.extend(['-pix_fmt', 'yuv420p'])
 
         if is_image:
-            cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-map', '0:v', '-map', '1:a', '-shortest'])
+            cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-map', '0:v', '-map', '1:a', '-shortest'])
         else:
             if codec == 'copy':
                 cmd.extend(['-c:a', 'copy'])
             else:
-                cmd.extend(['-c:a', 'aac', '-b:a', '192k'])
+                # Fixed sample rate so mixed-source clips concat cleanly
+                cmd.extend(['-c:a', 'aac', '-b:a', '192k', '-ar', '44100'])
 
         if fps > 0 and codec != 'copy':
             cmd.extend(['-r', str(fps)])
@@ -661,3 +677,125 @@ class FFmpegWrapper:
                 break
         filter_str = f"drawtext={ff_arg}text='{safe_text}':fontsize={fontsize}:fontcolor={fontcolor}:x=(w-text_w)/2:y={y_pos}:box=1:boxcolor=black@0.5:boxborderw=5"
         return self.build_filter(input_path, output_path, filter_str)
+
+    @staticmethod
+    def _atempo_chain(speed: float) -> str:
+        """FFmpeg's atempo only accepts 0.5-2.0 per instance; chain for larger factors."""
+        parts = []
+        remaining = float(speed)
+        while remaining > 2.0:
+            parts.append("atempo=2.0")
+            remaining /= 2.0
+        while remaining < 0.5:
+            parts.append("atempo=0.5")
+            remaining /= 0.5
+        parts.append(f"atempo={remaining:.4f}")
+        return ",".join(parts)
+
+    def _encode_args(self) -> List[str]:
+        """Video encoder args matching the detected hardware encoder."""
+        encoder = self.settings.get('encoder', 'libx264')
+        if encoder == 'h264_nvenc':
+            return ['-c:v', 'h264_nvenc', '-preset', 'p4', '-rc:v', 'vbr', '-cq', '18', '-b:v', '0']
+        elif encoder == 'h264_amf':
+            return ['-c:v', 'h264_amf', '-quality', 'quality', '-rc', 'cqp', '-qp_i', '18', '-qp_p', '18']
+        elif encoder == 'h264_qsv':
+            return ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-global_quality', '20']
+        elif encoder == 'h264_mf':
+            return ['-c:v', 'h264_mf', '-rate_control', 'vbr']
+        return ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-threads', '0']
+
+    def _has_audio_stream(self, media_path: str) -> bool:
+        cmd_probe = [
+            self.ffprobe_path, '-v', 'quiet', '-select_streams', 'a',
+            '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', media_path
+        ]
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            res = subprocess.run(cmd_probe, capture_output=True, text=True,
+                                 encoding='utf-8', errors='replace', creationflags=creationflags)
+            return bool(res.stdout and 'audio' in res.stdout.lower())
+        except Exception:
+            return False
+
+    def build_audio_mix_timeline(self, video_path: str, audio_clips: List[Dict],
+                                 output_path: str) -> List[str]:
+        """Mix timeline-positioned audio clips over the video's own audio.
+
+        audio_clips: [{'path', 'start', 'source_start', 'duration', 'volume'}]
+        Each clip is trimmed to its source window, delayed to its timeline
+        position (adelay), then everything is mixed in a single pass.
+        """
+        has_audio = self._has_audio_stream(video_path)
+
+        cmd = [self.ffmpeg_path, '-i', video_path]
+        for c in audio_clips:
+            cmd.extend(['-i', c['path']])
+
+        fparts = []
+        labels = []
+        for i, c in enumerate(audio_clips):
+            idx = i + 1
+            ss = max(0.0, float(c.get('source_start', 0.0)))
+            dur = float(c.get('duration', 0.0))
+            vol = float(c.get('volume', 1.0))
+            delay_ms = max(0, int(float(c.get('start', 0.0)) * 1000))
+            trim = f"atrim=start={ss:.3f}"
+            if dur > 0:
+                trim += f":end={(ss + dur):.3f}"
+            fparts.append(
+                f"[{idx}:a]{trim},asetpts=PTS-STARTPTS,volume={vol:.2f},"
+                f"adelay={delay_ms}|{delay_ms},aresample=44100[a{idx}]"
+            )
+            labels.append(f"[a{idx}]")
+
+        inputs = (["[0:a]"] if has_audio else []) + labels
+        if len(inputs) == 1:
+            fparts.append(f"{inputs[0]}anull[outa]")
+        else:
+            fparts.append(
+                f"{''.join(inputs)}amix=inputs={len(inputs)}:duration=first:dropout_transition=2[outa]"
+            )
+
+        cmd.extend([
+            '-filter_complex', ";".join(fparts),
+            '-map', '0:v', '-map', '[outa]',
+            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+        ])
+        if not has_audio:
+            cmd.append('-shortest')
+        cmd.extend(['-y', output_path])
+        return cmd
+
+    def build_overlay_pass(self, input_path: str, overlays: List[Dict],
+                           output_path: str, width: int = 0, height: int = 0) -> List[str]:
+        """Composite timeline image overlays onto the video.
+
+        overlays: [{'path', 'start', 'end'}] — each image is scaled to fit the
+        frame and shown only during its timeline window (enable=between).
+        """
+        cmd = [self.ffmpeg_path, '-i', input_path]
+        for ov in overlays:
+            cmd.extend(['-i', ov['path']])
+
+        parts = []
+        last = "[0:v]"
+        for i, ov in enumerate(overlays):
+            idx = i + 1
+            if width > 0 and height > 0:
+                parts.append(
+                    f"[{idx}:v]scale={width}:{height}:force_original_aspect_ratio=decrease[ov{idx}]"
+                )
+            else:
+                parts.append(f"[{idx}:v]null[ov{idx}]")
+            out = f"[v{idx}]"
+            parts.append(
+                f"{last}[ov{idx}]overlay=(W-w)/2:(H-h)/2:"
+                f"enable='between(t,{float(ov['start']):.3f},{float(ov['end']):.3f})'{out}"
+            )
+            last = out
+
+        cmd.extend(['-filter_complex', ";".join(parts), '-map', last, '-map', '0:a?'])
+        cmd.extend(self._encode_args())
+        cmd.extend(['-pix_fmt', 'yuv420p', '-c:a', 'copy', '-y', output_path])
+        return cmd

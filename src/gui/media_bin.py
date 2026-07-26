@@ -109,9 +109,10 @@ class MediaBinWidget(QWidget):
             self.refresh_library()
 
     def _on_item_clicked(self, item: QListWidgetItem):
-        path = item.data(Qt.UserRole)
-        if path and os.path.exists(path):
-            self.media_double_clicked.emit(path)
+        # Single click only selects the item. Adding to the timeline happens on
+        # double-click or the ➕ button — previously a single click added a clip,
+        # and a double-click added it twice.
+        pass
 
     def _on_add_to_timeline_clicked(self):
         current_item = self.list_widget.currentItem()

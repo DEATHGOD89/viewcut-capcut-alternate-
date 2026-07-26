@@ -19,6 +19,9 @@ class VideoEditor:
         self.settings = self.hardware.get_optimal_settings()
         self.ffmpeg = FFmpegWrapper(self.settings)
         self.temp_dir = tempfile.mkdtemp(prefix='vedit_')
+        import atexit
+        atexit.register(self.cleanup)
+        self._sweep_stale_temp_dirs()
         self.project = {
             'clips': [],
             'audio_tracks': [],
@@ -193,8 +196,10 @@ class VideoEditor:
                     resolution: str = 'source',
                     fps: int = None,
                     codec: str = None,
+                    speed: float = 1.0,
                     volume: float = 1.0,
-                    is_muted: bool = False) -> str:
+                    is_muted: bool = False,
+                    extra_vf: str = "") -> str:
         info = self.ffmpeg.get_video_info(input_path)
 
         if not resolution or resolution.lower() in ('source', 'auto', 'original'):
@@ -216,12 +221,23 @@ class VideoEditor:
         cmd = self.ffmpeg.build_render(input_path, output_path,
                                       start_time, end_time,
                                       width, height, fps, codec,
-                                      volume=volume, is_muted=is_muted)
+                                      speed=speed, volume=volume, is_muted=is_muted,
+                                      extra_vf=extra_vf)
 
-        logger.info(f"Rendering: {input_path} -> {output_path} at {width}x{height} (vol={volume}, muted={is_muted})")
+        logger.info(f"Rendering: {input_path} -> {output_path} at {width}x{height} (speed={speed}, vol={volume}, muted={is_muted})")
         return self._execute(cmd)
 
     def _parse_resolution(self, res: str) -> Tuple[int, int]:
+        s = str(res).lower().strip()
+        # Accept explicit "WxH" (used by the export pipeline for exact geometry)
+        if 'x' in s:
+            try:
+                w_str, h_str = s.split('x', 1)
+                w, h = int(w_str), int(h_str)
+                if w > 0 and h > 0:
+                    return (w - (w % 2), h - (h % 2))
+            except (ValueError, TypeError):
+                pass
         resolutions = {
             '720p': (1280, 720),
             '1080p': (1920, 1080),
@@ -233,17 +249,18 @@ class VideoEditor:
         }
         return resolutions.get(str(res).lower(), (1920, 1080))
 
-    def generate_black_video(self, output_path: str, duration: float, resolution: str, codec: str) -> str:
+    def generate_black_video(self, output_path: str, duration: float, resolution: str, codec: str, fps: float = 30.0) -> str:
         width, height = self._parse_resolution(resolution)
-        fps = 30
-        codec = codec if codec != 'copy' else 'libx264'
+        fps = fps if fps and fps > 0 else 30.0
+        codec = codec if codec not in ('copy', 'source') else 'libx264'
         cmd = [
             self.ffmpeg.ffmpeg_path,
-            '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:r={fps}',
-            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+            '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:r={fps:.3f}',
+            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
             '-t', str(duration),
             '-c:v', codec,
-            '-c:a', 'aac',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-ar', '44100',
             '-y', output_path
         ]
         logger.info(f"Generating black gap video: {duration}s -> {output_path}")
@@ -297,3 +314,20 @@ class VideoEditor:
                 logger.info("Cleaned up temporary files")
             except Exception:
                 pass
+
+    def _sweep_stale_temp_dirs(self):
+        """Remove vedit_* temp dirs left behind by crashed sessions (>1 day old)."""
+        import time
+        base = Path(tempfile.gettempdir())
+        cutoff = time.time() - 86400
+        try:
+            for d in base.glob('vedit_*'):
+                if str(d) == self.temp_dir:
+                    continue
+                try:
+                    if d.is_dir() and d.stat().st_mtime < cutoff:
+                        shutil.rmtree(d, ignore_errors=True)
+                except OSError:
+                    continue
+        except Exception:
+            pass

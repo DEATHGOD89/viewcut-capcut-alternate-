@@ -149,8 +149,10 @@ class CanvasFrame(QGraphicsView):
         zoom = getattr(self, 'zoom_factor', 1.0)
         vw *= zoom
         vh *= zoom
-        vx = (cw - vw) / 2
-        vy = (ch - vh) / 2
+        # Position honors pan (0.5 = centered), so drag-to-pan works in Fill/zoom
+        # modes — previously this unconditionally recentered, making pan a no-op.
+        vx = (cw - vw) * self.pan_x
+        vy = (ch - vh) * self.pan_y
 
         self.video_item.setSize(QSizeF(vw, vh))
         self.video_item.setPos(vx, vy)

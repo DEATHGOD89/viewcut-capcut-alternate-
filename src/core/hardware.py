@@ -5,10 +5,17 @@ import os
 from typing import Dict, Optional
 
 class HardwareInfo:
+    # Class-level cache: GPU probing shells out to nvidia-smi / PowerShell / ffmpeg
+    # with multi-second timeouts, and the result is identical for every instance.
+    # Without this, each editor object re-ran the full detection at startup.
+    _gpu_cache = None
+
     def __init__(self):
         self.cpu_cores = psutil.cpu_count(logical=True) or 4
         self.ram_gb = psutil.virtual_memory().total / (1024**3)
-        self.gpu_info = self._detect_gpu()
+        if HardwareInfo._gpu_cache is None:
+            HardwareInfo._gpu_cache = self._detect_gpu()
+        self.gpu_info = HardwareInfo._gpu_cache
         self.is_low_end = self._check_if_low_end()
 
     def _detect_gpu(self) -> Dict:

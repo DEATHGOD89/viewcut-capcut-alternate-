@@ -43,7 +43,7 @@ class ProxyGeneratorThread(QThread):
             ]
 
             logger.info(f"[PROXY ENGINE] Generating proxy: {' '.join(cmd)}")
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, creationflags=creationflags)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, creationflags=creationflags)
 
             if res.returncode == 0 and os.path.exists(proxy_path):
                 logger.info(f"[PROXY ENGINE] Proxy created successfully: {proxy_path}")
@@ -55,7 +55,7 @@ class ProxyGeneratorThread(QThread):
                     '-vf', 'scale=-2:540', '-c:v', 'libx264', '-preset', 'ultrafast',
                     '-c:a', 'aac', proxy_path
                 ]
-                res2 = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=60, creationflags=creationflags)
+                res2 = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=600, creationflags=creationflags)
                 if res2.returncode == 0 and os.path.exists(proxy_path):
                     self.finished_proxy.emit(self.source_path, proxy_path)
                 else:

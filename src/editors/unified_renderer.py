@@ -10,25 +10,78 @@ logger = get_logger(__name__)
 class UnifiedRenderer:
     """Unified Rendering Engine powering BOTH Live Preview and Video Export."""
 
+    # Cached VideoCapture per file so slider drags don't reopen the decoder each tick.
+    _cap_cache = {}
+    _MAX_PREVIEW_WIDTH = 1280
+
+    @classmethod
+    def _get_capture(cls, path):
+        cap = cls._cap_cache.get(path)
+        if cap is not None and cap.isOpened():
+            return cap
+        # Keep the cache tiny: release captures for other files
+        for old_path in list(cls._cap_cache.keys()):
+            if old_path != path:
+                try:
+                    cls._cap_cache.pop(old_path).release()
+                except Exception:
+                    pass
+        cap = cv2.VideoCapture(path)
+        cls._cap_cache[path] = cap
+        return cap
+
+    @classmethod
+    def release_captures(cls):
+        for cap in cls._cap_cache.values():
+            try:
+                cap.release()
+            except Exception:
+                pass
+        cls._cap_cache.clear()
+
     @staticmethod
-    def render_preview_frame(image_path_or_video: str, timestamp: float, effect_stack: EffectStack) -> QPixmap:
-        """Renders a live preview frame at timestamp using the exact EffectStack parameters."""
-        logger.info(f"[UNIFIED RENDERER] Rendering Preview Frame at {timestamp:.2f}s...")
+    def render_preview_frame(image_path_or_video: str, timestamp: float, effect_stack: EffectStack):
+        """Renders a live preview frame at timestamp using the exact EffectStack parameters.
+
+        Always returns a (QPixmap | None, ndarray | None) tuple so callers can
+        safely unpack the result on every code path.
+        """
         if not image_path_or_video or not os.path.exists(image_path_or_video):
             logger.warning(f"[UNIFIED RENDERER] Source file not found: {image_path_or_video}")
-            return None
+            return None, None
 
         try:
-            # 1. Read decoded video frame at timestamp using OpenCV
-            cap = cv2.VideoCapture(image_path_or_video)
+            # 1. Read decoded video frame at timestamp (cached OpenCV capture)
+            cap = UnifiedRenderer._get_capture(image_path_or_video)
             if timestamp > 0:
                 cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
             ret, frame = cap.read()
-            cap.release()
+
+            if not ret or frame is None:
+                # One retry with a fresh capture (file may have been replaced on disk)
+                UnifiedRenderer._cap_cache.pop(image_path_or_video, None)
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = UnifiedRenderer._get_capture(image_path_or_video)
+                if timestamp > 0:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+                ret, frame = cap.read()
 
             if not ret or frame is None:
                 logger.warning(f"[UNIFIED RENDERER] Failed to decode frame at {timestamp:.2f}s")
-                return None
+                return None, None
+
+            # Downscale large frames for interactive speed (preview only — export is full-res)
+            h0, w0 = frame.shape[:2]
+            if w0 > UnifiedRenderer._MAX_PREVIEW_WIDTH:
+                scale = UnifiedRenderer._MAX_PREVIEW_WIDTH / float(w0)
+                frame = cv2.resize(
+                    frame,
+                    (UnifiedRenderer._MAX_PREVIEW_WIDTH, max(2, int(h0 * scale))),
+                    interpolation=cv2.INTER_AREA
+                )
 
             # 2. Apply EffectStack Parameters (Non-destructive matrix shading)
             # A. Exposure & Contrast Scaling
@@ -81,7 +134,6 @@ class UnifiedRenderer:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
             pix = QPixmap.fromImage(qimg)
-            logger.info(f"[UNIFIED RENDERER] Preview Frame rendered successfully ({w}x{h}).")
             return pix, frame
         except Exception as err:
             logger.error(f"[UNIFIED RENDERER] Error rendering preview frame: {err}", exc_info=True)

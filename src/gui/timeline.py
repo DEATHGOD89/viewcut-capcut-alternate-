@@ -21,7 +21,13 @@ def _cache_set(key, val):
 
 def get_clip_thumbnail(file_path: str):
     if file_path in THUMBNAIL_CACHE:
-        return THUMBNAIL_CACHE[file_path]
+        val = THUMBNAIL_CACHE[file_path]
+        # Worker threads store QImage (QPixmap is not allowed off the GUI thread);
+        # convert to QPixmap here, on the GUI thread, on first access.
+        if isinstance(val, QImage):
+            val = QPixmap.fromImage(val)
+            _cache_set(file_path, val)
+        return val
         
     ext = Path(file_path).suffix.lower()
     if ext in ['.png', '.jpg', '.jpeg', '.bmp', '.webp']:
@@ -45,9 +51,9 @@ def get_clip_thumbnail(file_path: str):
                         cmd = [ffmpeg_path, '-ss', '0.5', '-i', file_path, '-vframes', '1', '-s', '120x67', '-y', temp_img]
                         subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=2, creationflags=creationflags)
                     if os.path.exists(temp_img):
-                        pixmap = QPixmap(temp_img)
-                        if not pixmap.isNull():
-                            _cache_set(file_path, pixmap)
+                        img = QImage(temp_img)
+                        if not img.isNull():
+                            _cache_set(file_path, img)
                 except Exception:
                     pass
             threading.Thread(target=_async_extract, daemon=True).start()
@@ -71,7 +77,7 @@ class ClipItem(QGraphicsRectItem):
         self._original_duration = 0
         
         if track_type == "subtitle":
-            self.color = QColor(140, 60, 200, 220) # CapCut purple for subtitles
+            self.color = QColor(140, 60, 200, 220) # Purple for subtitles
         elif track_type == "audio":
             self.color = QColor(40, 160, 90, 220) # Emerald green for audio
         else:

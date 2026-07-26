@@ -3,3 +3,6 @@ ffmpeg-python>=0.2.0
 numpy>=1.24.0
 pillow>=10.0.0
 psutil>=5.9.0
+opencv-python>=4.8.0
+# Needed for AI auto-subtitles (large download — pulls PyTorch):
+openai-whisper>=20231117

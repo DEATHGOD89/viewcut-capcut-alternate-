@@ -61,28 +61,26 @@ class ColorScopesWidget(QWidget):
         # Downsample source frame for high FPS scope calculations
         small = cv2.resize(self._current_image, (120, 90))
 
+        sh_, sw_ = small.shape[:2]
         if mode == 0:
-            # RGB PARADE
+            # RGB PARADE (vectorized — the per-pixel Python loops were ~100x slower)
             sub_w = w // 3
+            cols = np.tile(np.arange(sw_), sh_)
             for c_idx, color in enumerate([(255, 50, 50), (50, 255, 50), (50, 100, 255)]):  # B, G, R
                 channel = small[:, :, c_idx]
-                col_x = c_idx * sub_w
-                for col in range(small.shape[1]):
-                    x_pos = col_x + int((col / small.shape[1]) * sub_w)
-                    for val in channel[:, col]:
-                        y_pos = h - 1 - int((val / 255.0) * (h - 1))
-                        canvas[y_pos, x_pos] = color
+                x_pos = c_idx * sub_w + ((cols / sw_) * sub_w).astype(np.int32)
+                y_pos = (h - 1) - ((channel.flatten() / 255.0) * (h - 1)).astype(np.int32)
+                canvas[y_pos, x_pos] = color
         elif mode == 1:
-            # LUMINANCE WAVEFORM
+            # LUMINANCE WAVEFORM (vectorized)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            for col in range(small.shape[1]):
-                x_pos = int((col / small.shape[1]) * w)
-                for val in gray[:, col]:
-                    y_pos = h - 1 - int((val / 255.0) * (h - 1))
-                    canvas[y_pos, x_pos] = (0, 255, 204)  # Cyan scope intensity
+            cols = np.tile(np.arange(sw_), sh_)
+            x_pos = ((cols / sw_) * w).astype(np.int32)
+            y_pos = (h - 1) - ((gray.flatten() / 255.0) * (h - 1)).astype(np.int32)
+            canvas[y_pos, x_pos] = (0, 255, 204)  # Cyan scope intensity
         else:
             # HISTOGRAM
-            hist = cv2.calcHist([small], [0, 1, 2], None, [256, 256, 256], [0, 256, 0, 256, 0, 256])
+            # (removed: an unused 256^3-bin cv2.calcHist call here allocated ~67MB per frame)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
             hist_g = cv2.calcHist([gray], [0], None, [256], [0, 256])
             cv2.normalize(hist_g, hist_g, 0, h - 10, cv2.NORM_MINMAX)

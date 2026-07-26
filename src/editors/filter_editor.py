@@ -73,7 +73,7 @@ class FilterEditor:
             'bloom': f"eq=brightness={0.05*intensity:.2f}:contrast={1.1*intensity:.2f},colorbalance=rs={0.05*intensity:.2f}:gs={0.05*intensity:.2f}:bs={0.08*intensity:.2f}",
             'glow': f"eq=brightness={0.03*intensity:.2f}:saturation={1.2*intensity:.2f}",
 
-            # 8. High-End Commercial AMV & CapCut Effects (Inspected from Telegram Desktop Samples)
+            # 8. High-End Commercial AMV & Social-Style Effects
             'super_anime_hdr_glow': f"unsharp=7:7:{2.2*intensity:.2f}:7:7:0.0,eq=contrast={1.35*intensity:.2f}:saturation={1.5*intensity:.2f}:gamma=1.1,colorbalance=rs={0.08*intensity:.2f}:gs={0.15*intensity:.2f}:bs={0.08*intensity:.2f}",
             'spiderverse_anime': f"unsharp=9:9:{2.5*intensity:.2f}:9:9:0.0,colorbalance=rs={0.2*intensity:.2f}:gs={0.08*intensity:.2f}:bs=-{0.1*intensity:.2f}:rh={0.15*intensity:.2f}:gh={0.05*intensity:.2f}:bh=-{0.05*intensity:.2f},eq=contrast={1.28*intensity:.2f}:saturation={1.45*intensity:.2f}",
             'pop_art_comic': f"unsharp=11:11:{3.0*intensity:.2f}:11:11:0.0,eq=contrast={1.4*intensity:.2f}:saturation={1.8*intensity:.2f}:brightness=0.03",
@@ -234,14 +234,16 @@ class FilterEditor:
 
     def get_delogo_filter_string(self, x: int, y: int, width: int, height: int,
                                  video_width: int = 0, video_height: int = 0) -> str:
+        # FFmpeg's delogo REQUIRES >=1px margin on every side of the rectangle,
+        # otherwise it fails with "Logo area is outside of the frame".
         if video_width > 0 and video_height > 0:
-            x = max(0, min(x, video_width - 2))
-            y = max(0, min(y, video_height - 2))
-            width = max(2, min(width, video_width - x))
-            height = max(2, min(height, video_height - y))
+            x = max(1, min(x, video_width - 3))
+            y = max(1, min(y, video_height - 3))
+            width = max(2, min(width, video_width - x - 1))
+            height = max(2, min(height, video_height - y - 1))
         else:
-            x = max(0, x)
-            y = max(0, y)
+            x = max(1, x)
+            y = max(1, y)
             width = max(2, width)
             height = max(2, height)
 

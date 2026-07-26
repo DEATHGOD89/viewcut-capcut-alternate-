@@ -129,7 +129,8 @@ class SpeechToTextEngine:
         Supports Hindi, English, Romanized Hindi (Hinglish), and auto-translation.
         """
         segments = []
-        temp_wav = f"{video_path}_temp_speech.wav"
+        import tempfile
+        temp_wav = os.path.join(tempfile.gettempdir(), f"veditor_speech_{abs(hash(video_path))}.wav")
         
         # Guarantee FFmpeg binary directory is in OS PATH for Whisper's internal subprocess calls
         if self.ffmpeg_path and os.path.exists(self.ffmpeg_path):
@@ -241,7 +242,8 @@ class SpeechToTextEngine:
                 for idx, seg in enumerate(segments, 1):
                     s_str = self.format_srt_time(seg['start'])
                     e_str = self.format_srt_time(seg['end'])
-                    clean_t = "".join(c for c in seg['text'] if ord(c) < 1000 and (c.isalnum() or c in " .,!?-+()[]:;/_\"\n"))
+                    # Strip only control characters — keeps Devanagari/Hindi and all other scripts intact
+                    clean_t = "".join(c for c in seg['text'] if c == '\n' or c.isprintable())
                     f.write(f"{idx}\n{s_str} --> {e_str}\n{clean_t.strip()}\n\n")
 
         return segments

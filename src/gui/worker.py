@@ -110,7 +110,8 @@ class SubtitleWorker(QThread):
                 for idx, seg in enumerate(all_segments, 1):
                     s_str = self.engine.format_srt_time(seg['start'])
                     e_str = self.engine.format_srt_time(seg['end'])
-                    clean_t = "".join(c for c in seg['text'] if ord(c) < 1000 and (c.isalnum() or c in " .,!?-+()[]:;/_\"\n"))
+                    # Strip only control characters — keeps Devanagari/Hindi and all other scripts intact
+                    clean_t = "".join(c for c in seg['text'] if c == '\n' or c.isprintable())
                     f.write(f"{idx}\n{s_str} --> {e_str}\n{clean_t.strip()}\n\n")
 
             self.finished.emit(all_segments, self.srt_path)

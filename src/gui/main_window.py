@@ -4,6 +4,8 @@ from PySide6.QtGui import *
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 import os
+import json
+import subprocess
 from pathlib import Path
 
 from editors.video_editor import VideoEditor
@@ -49,6 +51,9 @@ class MainWindow(QMainWindow):
         self._temp_files = []
         self._undo_stack = []
         self._redo_stack = []
+        self.worker = None
+        self._sub_worker = None
+        self._current_video_source = None
 
         self.media_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -60,7 +65,13 @@ class MainWindow(QMainWindow):
         
         self.playback_timer = QTimer(self)
         self.playback_timer.timeout.connect(self._playback_tick)
-        
+
+        # Debounce timer so slider drags don't decode+render a frame on every tick
+        self._preview_debounce = QTimer(self)
+        self._preview_debounce.setSingleShot(True)
+        self._preview_debounce.setInterval(75)
+        self._preview_debounce.timeout.connect(self._render_live_preview_now)
+
         self.media_player.durationChanged.connect(self._on_duration_changed)
         self.media_player.positionChanged.connect(self._on_player_position_changed)
 
@@ -72,16 +83,27 @@ class MainWindow(QMainWindow):
         from editors.proxy_engine import ProxyEngine
         self.proxy_engine = ProxyEngine(self.video_editor.ffmpeg.ffmpeg_path, encoder=self.video_editor.hardware.gpu_info.get('encoder', 'libx264'))
 
+    def _guard_typing(self, fn):
+        """Ignore single-letter shortcuts while the user is typing in a text field."""
+        def _cb():
+            w = QApplication.focusWidget()
+            if isinstance(w, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
+                return
+            fn()
+        return _cb
+
     def setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+Z"), self, self.undo)
         QShortcut(QKeySequence("Ctrl+Y"), self, self.redo)
         QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self.redo)
-        QShortcut(QKeySequence("Space"), self, self.toggle_playback)
-        QShortcut(QKeySequence("Delete"), self, self.delete_selected_clip)
-        QShortcut(QKeySequence("S"), self, self.split_video)
-        QShortcut(QKeySequence("V"), self, self._toggle_move_clip_mode)
-        QShortcut(QKeySequence("F"), self, self.toggle_fullscreen_preview)
-        QShortcut(QKeySequence("C"), self, lambda: self.canvas_frame.set_roi_selection_mode(True))
+        QShortcut(QKeySequence("Ctrl+S"), self, self.save_project)
+        QShortcut(QKeySequence("Ctrl+O"), self, self.open_project)
+        QShortcut(QKeySequence("Space"), self, self._guard_typing(self.toggle_playback))
+        QShortcut(QKeySequence("Delete"), self, self._guard_typing(self.delete_selected_clip))
+        QShortcut(QKeySequence("S"), self, self._guard_typing(self.split_video))
+        QShortcut(QKeySequence("V"), self, self._guard_typing(self._toggle_move_clip_mode))
+        QShortcut(QKeySequence("F"), self, self._guard_typing(self.toggle_fullscreen_preview))
+        QShortcut(QKeySequence("C"), self, self._guard_typing(lambda: self.canvas_frame.set_roi_selection_mode(True)))
 
     def _save_undo_state(self):
         import copy
@@ -90,16 +112,27 @@ class MainWindow(QMainWindow):
         self._undo_stack.append(copy.deepcopy(self.project))
         self._redo_stack.clear()
 
+    def _rebind_default_tracks(self):
+        """Point the convenience track references at the current project's tracks,
+        creating any that are missing (e.g. older project files)."""
+        def _find_or_create(ttype, name):
+            tr = next((t for t in self.project.tracks if t.track_type == ttype), None)
+            if tr is None:
+                tr = Track(name, ttype)
+                self.project.add_track(tr)
+            return tr
+        self.sub_track = _find_or_create('subtitle', "🔤 Subtitles & Text")
+        self.overlay_track = _find_or_create('overlay', "🖼️ Image / PiP Overlay")
+        self.video_track = _find_or_create('video', "🎬 Video Track 1")
+        self.audio_track = _find_or_create('audio', "🎵 Audio Track 1")
+
     def undo(self):
         if not self._undo_stack:
             return
         import copy
         self._redo_stack.append(copy.deepcopy(self.project))
         self.project = self._undo_stack.pop()
-        self.sub_track = next((t for t in self.project.tracks if t.track_type == 'subtitle'), self.project.tracks[0] if self.project.tracks else Track("🔤 Subtitles & Text", "subtitle"))
-        self.overlay_track = next((t for t in self.project.tracks if t.track_type == 'overlay'), self.project.tracks[1] if len(self.project.tracks) > 1 else Track("🖼️ Image / PiP Overlay", "overlay"))
-        self.video_track = next((t for t in self.project.tracks if t.track_type == 'video'), self.project.tracks[2] if len(self.project.tracks) > 2 else Track("🎬 Video Track 1", "video"))
-        self.audio_track = next((t for t in self.project.tracks if t.track_type == 'audio'), self.project.tracks[3] if len(self.project.tracks) > 3 else Track("🎵 Audio Track 1", "audio"))
+        self._rebind_default_tracks()
         self._last_active_clip = None
         self.timeline.load_project(self.project)
 
@@ -109,12 +142,56 @@ class MainWindow(QMainWindow):
         import copy
         self._undo_stack.append(copy.deepcopy(self.project))
         self.project = self._redo_stack.pop()
-        self.sub_track = next((t for t in self.project.tracks if t.track_type == 'subtitle'), self.project.tracks[0] if self.project.tracks else Track("🔤 Subtitles & Text", "subtitle"))
-        self.overlay_track = next((t for t in self.project.tracks if t.track_type == 'overlay'), self.project.tracks[1] if len(self.project.tracks) > 1 else Track("🖼️ Image / PiP Overlay", "overlay"))
-        self.video_track = next((t for t in self.project.tracks if t.track_type == 'video'), self.project.tracks[2] if len(self.project.tracks) > 2 else Track("🎬 Video Track 1", "video"))
-        self.audio_track = next((t for t in self.project.tracks if t.track_type == 'audio'), self.project.tracks[3] if len(self.project.tracks) > 3 else Track("🎵 Audio Track 1", "audio"))
+        self._rebind_default_tracks()
         self._last_active_clip = None
         self.timeline.load_project(self.project)
+
+    def save_project(self):
+        default_dir = os.path.join(os.path.expanduser("~"), "Videos")
+        os.makedirs(default_dir, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project As...",
+            os.path.join(default_dir, f"{self.project.name or 'project'}.veproj.json"),
+            "Video Editor Project (*.veproj.json *.json);;All Files (*.*)")
+        if not path:
+            return
+        try:
+            data = {
+                'app': 'VideoEditorLite',
+                'version': 1,
+                'project': self.project.to_dict(),
+                'media_library': list(getattr(self.media_bin, 'media_paths', [])),
+            }
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            self.statusBar().showMessage(f"💾 Project saved: {path}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", f"Could not save project:\n{e}")
+
+    def open_project(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Project...", os.path.join(os.path.expanduser("~"), "Videos"),
+            "Video Editor Project (*.veproj.json *.json);;All Files (*.*)")
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            proj_data = data.get('project', data)
+            self._save_undo_state()
+            self.project = Project.from_dict(proj_data)
+            self._rebind_default_tracks()
+            self._last_active_clip = None
+            self._current_video_source = None
+            media_paths = data.get('media_library', [])
+            if media_paths:
+                self.media_bin.set_media_paths(media_paths)
+            self.timeline.load_project(self.project)
+            self._sync_media_player(0.0, force_seek=True)
+            self.update_time_label()
+            self.statusBar().showMessage(f"📁 Project loaded: {Path(path).name}", 5000)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Failed", f"Could not open project:\n{e}")
 
     def toggle_playback(self):
         if self.playback_timer.isActive():
@@ -185,6 +262,14 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.open_file)
         self.toolbar.addAction(open_action)
 
+        save_proj_action = QAction("💾 Save Project", self)
+        save_proj_action.triggered.connect(self.save_project)
+        self.toolbar.addAction(save_proj_action)
+
+        open_proj_action = QAction("📁 Open Project", self)
+        open_proj_action.triggered.connect(self.open_project)
+        self.toolbar.addAction(open_proj_action)
+
         self.toolbar.addSeparator()
 
         magic_ai_action = QAction("🪄 Magic AI Auto-Enhance", self)
@@ -233,7 +318,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(btn_widget)
 
-        # CapCut Timeline Action Bar
+        # Timeline Action Bar
         action_bar = QWidget()
         action_layout = QHBoxLayout(action_bar)
         action_layout.setContentsMargins(0, 4, 0, 4)
@@ -397,7 +482,7 @@ class MainWindow(QMainWindow):
         upscale_layout = QFormLayout()
         self.ai_model_combo = QComboBox()
         self.ai_model_combo.addItems([
-            '💎 Heavy-Duty Studio Mode (Max Topaz 95%+ Quality)',
+            '💎 Heavy-Duty Studio Mode (Maximum Quality)',
             '🎥 Real Video (Live-Action & People)',
             '🎨 Anime & Cartoon (Line-Art & Cell-Shading)'
         ])
@@ -625,7 +710,7 @@ class MainWindow(QMainWindow):
         self.text_bg_style_combo = QComboBox()
         self.text_bg_style_combo.addItems([
             'Transparent (Clean Glow)',
-            '✨ CapCut Yellow Highlight',
+            '✨ Yellow Highlight',
             '💎 Cyberpunk Neon',
             '⬛ Dark Translucent Box',
             '🔴 Red Action Box'
@@ -650,7 +735,7 @@ class MainWindow(QMainWindow):
         self.sub_translate_cb.setChecked(True)
         text_layout.addRow("", self.sub_translate_cb)
 
-        self.enable_auto_sub_cb = QCheckBox("Enable CapCut Auto Subtitles")
+        self.enable_auto_sub_cb = QCheckBox("Enable Auto Subtitles (burn into export)")
         text_layout.addRow("", self.enable_auto_sub_cb)
 
         generate_sub_btn = QPushButton("✨ Auto Subtitles (Voice-to-Text)")
@@ -828,9 +913,24 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(style)
 
     def closeEvent(self, event):
-        if hasattr(self, 'worker') and self.worker.isRunning():
+        if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(2000)
+        if self._sub_worker is not None and self._sub_worker.isRunning():
+            self._sub_worker.wait(1500)
+        if hasattr(self, 'hw_timer'):
+            self.hw_timer.stop()
+        self.playback_timer.stop()
+        self.media_player.stop()
+        self.timeline_audio_player.stop()
+        try:
+            from editors.unified_renderer import UnifiedRenderer
+            UnifiedRenderer.release_captures()
+        except Exception:
+            pass
+        if hasattr(self, 'proxy_engine'):
+            for th in list(getattr(self.proxy_engine, 'active_threads', [])):
+                th.wait(200)
 
         self.config.settings['last_format'] = self.format_combo.currentText()
         self.config.settings['last_quality'] = self.quality_combo.currentText()
@@ -891,28 +991,6 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QApplication
         QApplication.processEvents()
 
-    def run_magic_ai_auto_enhance(self):
-        if not self.video_track.clips:
-            QMessageBox.warning(self, "No Video", "Please add a video clip to the timeline first!")
-            return
-
-        file_path = self.video_track.clips[0].file_path
-        info = self.video_editor.get_video_info(file_path)
-        w = info.get('width', 1920)
-        h = info.get('height', 1080)
-
-        # Smart content detection
-        if w <= 1920 or h <= 1080:
-            self.ai_upscale_combo.setCurrentText('2160p 4K')
-
-        if 'anime' in file_path.lower() or 'cartoon' in file_path.lower() or 'dbz' in file_path.lower() or 'broly' in file_path.lower():
-            self.ai_model_combo.setCurrentText('🎨 Anime & Cartoon (Line-Art & Cell-Shading)')
-        else:
-            self.ai_model_combo.setCurrentText('🎥 Real Video (Live-Action & People)')
-
-        self.apply_one_click_ai_enhance()
-        QMessageBox.information(self, "🪄 Magic AI Auto-Enhance", "Smart AI Content Analysis Complete!\n\n- Model Preset Selected\n- Dual-Pass High-Frequency Super-Resolution Activated\n- Color Balance Corrected\n\nClick Export to render in 4K Master Quality!")
-
     def keyPressEvent(self, event):
         key = event.key()
         mods = event.modifiers()
@@ -962,6 +1040,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please add a video clip to the timeline first.")
             return
 
+        if self._sub_worker is not None and self._sub_worker.isRunning():
+            QMessageBox.information(self, "Auto Subtitles", "Subtitle generation is already running — please wait for it to finish.")
+            return
+
         from utils.speech_engine import SpeechToTextEngine
         from gui.worker import SubtitleWorker
         from PySide6.QtWidgets import QProgressDialog
@@ -971,8 +1053,8 @@ class MainWindow(QMainWindow):
         lang = self.sub_lang_combo.currentText()
         trans = self.sub_translate_cb.isChecked()
 
-        progress_dlg = QProgressDialog("✨ OpenAI Whisper AI Voice Subtitles Generating...\nPlease wait...", None, 0, 0, self)
-        progress_dlg.setWindowTitle("CapCut Auto Subtitles")
+        progress_dlg = QProgressDialog("✨ Whisper AI Voice Subtitles Generating...\nPlease wait...", None, 0, 0, self)
+        progress_dlg.setWindowTitle("Auto Subtitles")
         progress_dlg.setCancelButton(None)
         progress_dlg.setWindowModality(Qt.WindowModal)
         progress_dlg.show()
@@ -986,20 +1068,17 @@ class MainWindow(QMainWindow):
             self._live_subtitles = all_segments
             self.enable_auto_sub_cb.setChecked(True)
 
-            sub_track = None
-            for t in self.project.tracks:
-                if t.name == "🔤 Subtitles":
-                    sub_track = t
-                    break
-
+            # Reuse the existing subtitle track (matching by type — matching by a
+            # different name used to create a duplicate track every project)
+            sub_track = next((t for t in self.project.tracks if t.track_type == 'subtitle'), None)
             if not sub_track:
-                sub_track = Track("🔤 Subtitles", "subtitle")
+                sub_track = Track("🔤 Subtitles & Text", "subtitle")
                 self.project.add_track(sub_track)
 
             sub_track.clips.clear()
             for seg in all_segments:
                 c_dur = max(0.5, seg['end'] - seg['start'])
-                c = Clip(self.current_file, seg['start'], c_dur, text=seg['text'])
+                c = Clip(self.current_file or "", seg['start'], c_dur, text=seg['text'], clip_type="text")
                 sub_track.add_clip(c)
 
             self.timeline.load_project(self.project, maintain_position=True)
@@ -1010,8 +1089,8 @@ class MainWindow(QMainWindow):
             preview_sample = " | ".join(seg['text'] for seg in all_segments[:3]) if all_segments else "No voice detected"
             QMessageBox.information(
                 self,
-                "CapCut Auto Subtitles Generated",
-                f"CapCut Voice Auto Subtitles Generated Successfully!\n\nTimed Subtitle Lines: {len(all_segments)}\nPreview Sample: '{preview_sample}'"
+                "Auto Subtitles Generated",
+                f"Voice subtitles generated successfully!\n\nTimed Subtitle Lines: {len(all_segments)}\nPreview Sample: '{preview_sample}'"
             )
             self._update_live_text_preview()
 
@@ -1132,17 +1211,17 @@ class MainWindow(QMainWindow):
             a_tr = self.audio_track
             end_t = max((c.end_time for c in a_tr.clips), default=playhead_time)
             a_dur = info.get('duration', 10.0)
-            a_tr.add_clip(Clip(file_path, end_t, a_dur))
+            a_tr.add_clip(Clip(file_path, end_t, a_dur, clip_type="audio"))
             self.timeline.load_project(self.project, maintain_position=True)
-            QMessageBox.information(self, "Audio Added", f"Added audio '{Path(file_path).name}' to Audio Track!")
+            self.statusBar().showMessage(f"🎵 Added audio '{Path(file_path).name}' to Audio Track", 4000)
             return
 
         if is_image:
             img_dur = 5.0
-            self.overlay_track.add_clip(Clip(file_path, playhead_time, img_dur))
+            self.overlay_track.add_clip(Clip(file_path, playhead_time, img_dur, clip_type="image"))
             self.timeline.load_project(self.project, maintain_position=True)
             self._sync_media_player(playhead_time, force_seek=True)
-            QMessageBox.information(self, "Image Overlay Added", f"Added Image Overlay '{Path(file_path).name}' to Image/PiP Track at {playhead_time:.2f}s!")
+            self.statusBar().showMessage(f"🖼️ Added image overlay '{Path(file_path).name}' at {playhead_time:.2f}s", 4000)
             return
 
         w = info.get('width', 1920)
@@ -1162,8 +1241,14 @@ class MainWindow(QMainWindow):
         end_time = max((clip.end_time for clip in self.video_track.clips), default=0.0)
         self.video_track.add_clip(Clip(file_path, end_time, duration))
         self.timeline.load_project(self.project, maintain_position=True)
+        self.statusBar().showMessage(f"🎬 Added '{Path(file_path).name}' to timeline", 4000)
+
+        # Background 540p proxy for smooth preview scrubbing (export uses the original)
+        if hasattr(self, 'proxy_engine'):
+            self.proxy_engine.generate_proxy_async(file_path)
 
         self.current_file = file_path
+        self._current_video_source = None  # force proxy-aware source re-resolve
         self.media_player.setSource(QUrl.fromLocalFile(file_path))
 
         self._sync_media_player(end_time, force_seek=True)
@@ -1235,58 +1320,6 @@ class MainWindow(QMainWindow):
         if file_path:
             self.add_media_from_bin(file_path)
 
-    def add_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Add Image",
-            "",
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)"
-        )
-        if file_path:
-            self.add_media_from_bin(file_path)
-
-    def add_filter_row(self):
-        row_widget = QWidget()
-        row_layout = QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        
-        combo = QComboBox()
-        combo.addItems([
-            'Super Anime HDR Glow', 'SpiderVerse Anime', 'Pop Art Comic', 'Cyberpunk Neon Hologram',
-            'AI Enhance', 'AI Denoise', 'AI Deblur', 'AI Skin Smooth', 'AI Dehaze',
-            'Teal Orange', 'Vivid', 'Warm Glow', 'Cyberpunk', 'Soft Skin', 'Film Noir', 'Cinematic',
-            'Exposure', 'Brightness', 'Contrast', 'Highlights', 'Shadows', 'Whites', 'Blacks', 'Gamma',
-            'Temperature', 'Tint', 'Vibrance', 'Hue', 'White Balance', 'Warm', 'Cool',
-            'Sharpness', 'Edge Sharpen', 'Clarity', 'Texture',
-            'Gaussian Blur', 'Box Blur', 'Bokeh',
-            'Vignette', 'Film Grain', 'Bloom', 'Glow',
-            'Anime', 'Cartoon', 'Vintage', 'Black White'
-        ])
-        combo.currentTextChanged.connect(self._update_live_filter_preview)
-        row_widget.combo = combo
-
-        val_label = QLabel("100%")
-        val_label.setFixedWidth(45)
-        val_label.setStyleSheet("color: #00ffcc; font-weight: bold;")
-        row_widget.val_label = val_label
-
-        slider = QSlider(Qt.Horizontal)
-        slider.setRange(0, 200)
-        slider.setValue(100)
-        slider.valueChanged.connect(lambda v: (val_label.setText(f"{v}%"), self._update_live_filter_preview()))
-        row_widget.slider = slider
-        
-        remove_btn = QPushButton("X")
-        remove_btn.setFixedSize(24, 24)
-        remove_btn.clicked.connect(lambda: self._remove_filter_row(row_widget))
-        
-        row_layout.addWidget(combo)
-        row_layout.addWidget(slider)
-        row_layout.addWidget(val_label)
-        row_layout.addWidget(remove_btn)
-        self.filters_layout.addWidget(row_widget)
-        self._update_live_filter_preview()
-
     def _update_live_filter_preview(self):
         if not hasattr(self, 'effect_stack'):
             from editors.effect_stack import EffectStack
@@ -1328,15 +1361,27 @@ class MainWindow(QMainWindow):
         # 4. Canvas tint overlay
         self.canvas_frame.apply_live_color_tuning(b, c, s, t, e, dn, sh)
 
-        # 5. Render live preview frame using UnifiedRenderer
-        if self.current_file:
-            from editors.unified_renderer import UnifiedRenderer
-            pos_sec = self.timeline.get_position()
-            pix, raw_frame = UnifiedRenderer.render_preview_frame(self.current_file, pos_sec, self.effect_stack)
-            has_active_effects = bool(b!=0 or c!=0 or s!=0 or t!=0 or e!=0 or dn!=0 or sh!=0 or proc_filters)
-            self.canvas_frame.set_image_overlay(pix if has_active_effects else None)
-            if hasattr(self, 'color_scopes_widget') and raw_frame is not None:
-                self.color_scopes_widget.update_frame(raw_frame)
+        # 5. Debounced heavy render — decoding a frame per slider tick froze the UI
+        self._preview_debounce.start()
+
+    def _render_live_preview_now(self):
+        """The expensive half of the live preview: decode a frame and shade it."""
+        if not self.current_file:
+            return
+        es = getattr(self, 'effect_stack', None)
+        if es is None:
+            return
+        from editors.unified_renderer import UnifiedRenderer
+        pos_sec = self.timeline.get_position()
+        preview_src = self.proxy_engine.get_preview_path(self.current_file) if hasattr(self, 'proxy_engine') else self.current_file
+        pix, raw_frame = UnifiedRenderer.render_preview_frame(preview_src, pos_sec, es)
+        has_active_effects = bool(
+            es.brightness or es.contrast or es.saturation or es.temperature
+            or es.exposure or es.denoise or es.sharpness or es.preset_filters
+        )
+        self.canvas_frame.set_image_overlay(pix if (has_active_effects and pix is not None) else None)
+        if hasattr(self, 'color_scopes_widget') and raw_frame is not None:
+            self.color_scopes_widget.update_frame(raw_frame)
 
     def run_magic_ai_auto_enhance(self):
         """1-Click Magic AI Auto-Enhance & Ultra-Master Engine."""
@@ -1345,7 +1390,7 @@ class MainWindow(QMainWindow):
         self.sharp_slider.setValue(0)
         self.denoise_slider.setValue(0)
         if hasattr(self, 'ai_model_combo'):
-            self.ai_model_combo.setCurrentText('💎 Heavy-Duty Studio Mode (Max Topaz 95%+ Quality)')
+            self.ai_model_combo.setCurrentText('💎 Heavy-Duty Studio Mode (Maximum Quality)')
         if hasattr(self, 'ai_strength_slider'):
             self.ai_strength_slider.setValue(85)
         if hasattr(self, 'ai_upscale_combo'):
@@ -1358,35 +1403,6 @@ class MainWindow(QMainWindow):
             "• Contrast Adaptive Dual-Kernel Sharpening + HDR S-Curve Active!\n"
             "• 4K Ultra HD Super-Resolution High-Precision AI Active!"
         )
-
-    def apply_one_click_ai_enhance(self):
-        self.add_filter_row()
-        count = self.filters_layout.count()
-        if count > 0:
-            last_widget = self.filters_layout.itemAt(count - 1).widget()
-            if hasattr(last_widget, 'combo'):
-                idx = last_widget.combo.findText('AI Enhance')
-                if idx >= 0:
-                    last_widget.combo.setCurrentIndex(idx)
-
-    def _remove_filter_row(self, row_widget):
-        self.filters_layout.removeWidget(row_widget)
-        row_widget.deleteLater()
-        QTimer.singleShot(50, self._update_live_filter_preview)
-
-    def add_audio(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Add Audio Track",
-            "",
-            "Audio Files (*.mp3 *.wav *.aac *.m4a *.flac)"
-        )
-        if file_path:
-            self.add_media_from_bin(file_path)
-
-    def toggle_drag_mode(self, checked):
-        self.drag_mode_action.setText(f"Move Mode: {'ON' if checked else 'OFF'}")
-        self.timeline.set_drag_mode(checked)
 
     def _on_aspect_ratio_changed(self, text):
         ratios = {
@@ -1435,6 +1451,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Please open a video first")
             return
 
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Export", "An export is already running — please wait for it to finish or cancel it first.")
+            return
+
         format_ext = f".{self.format_combo.currentText().lower()}"
         is_audio_only = (format_ext == '.mp3')
 
@@ -1454,21 +1474,14 @@ class MainWindow(QMainWindow):
         if not output_path:
             return  # User cancelled dialog
 
-        active_filters = []
-        if hasattr(self, 'ai_strength_slider'):
-            val = self.ai_strength_slider.value() / 100.0
-            if val > 0:
-                active_filters.append(('AI Enhance', val))
-        if hasattr(self, 'filters_layout'):
-            for i in range(self.filters_layout.count()):
-                widget = self.filters_layout.itemAt(i).widget()
-                if widget and hasattr(widget, 'combo') and hasattr(widget, 'slider'):
-                    f_type = widget.combo.currentText()
-                    val = widget.slider.value() / 100.0
-                    active_filters.append((f_type, val))
+        # Make sure the EffectStack reflects the current slider state
+        self._update_live_filter_preview()
 
-        resolution = self.res_combo.currentText()
-        codec = self.config.settings.get('encoder', 'libx264')
+        # Snapshot ALL UI + timeline state into plain data now, on the GUI
+        # thread — the worker thread must never read Qt widgets directly.
+        opts = self._snapshot_export_options(is_audio_only)
+        opts['filtered_temp'] = self._get_output_path("filtered", ".mp4", is_temp=True)
+        opts['audio_temp'] = self._get_output_path("audio_mod", ".mp4", is_temp=True)
 
         self.progress_dialog = QProgressDialog("Exporting video...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
@@ -1476,25 +1489,19 @@ class MainWindow(QMainWindow):
         self.progress_dialog.setValue(0)
         self.progress_dialog.show()
 
-        source = self.current_file or (self.video_track.clips[0].file_path if self.video_track.clips else "")
-        volume = self.volume_slider.value()
-        voice_boost = self.voice_boost_btn.isChecked()
-        filtered_temp = self._get_output_path("filtered", ".mp4", is_temp=True)
-        audio_temp = self._get_output_path("audio_mod", ".mp4", is_temp=True)
-
         self.worker = FFmpegWorker(
-            self._run_export_sequence, 
-            source, output_path, active_filters, is_audio_only, volume, voice_boost, resolution.lower(), codec, filtered_temp, audio_temp,
+            self._run_export_sequence,
+            opts, output_path,
             total_duration=self.project.get_duration(),
             editors=[self.video_editor, self.filter_editor, self.audio_editor]
         )
-        
+
         def _update_progress_dialog(pct, msg):
             self.progress_dialog.setLabelText(msg)
             self.progress_dialog.setValue(pct)
 
         self.worker.status_updated.connect(_update_progress_dialog)
-        
+
         def _clean_up_temps():
             for f in list(self._temp_files):
                 try:
@@ -1511,7 +1518,7 @@ class MainWindow(QMainWindow):
             if os.path.exists(output_path):
                 if os.name == 'nt':
                     try:
-                        subprocess.Popen(f'explorer /select,"{os.path.abspath(output_path)}"', shell=True)
+                        subprocess.Popen(['explorer', '/select,', os.path.abspath(output_path)])
                     except Exception:
                         pass
                 QMessageBox.information(self, "Export Complete! 🎉", f"Video exported successfully!\n\nLocation:\n{output_path}")
@@ -1527,6 +1534,97 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(on_error)
         self.progress_dialog.canceled.connect(self.worker.cancel)
         self.worker.start()
+
+    def _track_is_active(self, track) -> bool:
+        """Mute/Solo resolution: any soloed track silences all non-soloed ones."""
+        if track is None:
+            return False
+        if track.is_muted:
+            return False
+        any_solo = any(t.is_solo for t in self.project.tracks)
+        if any_solo and not track.is_solo:
+            return False
+        return True
+
+    def _snapshot_export_options(self, is_audio_only: bool) -> dict:
+        """Copy every piece of UI + timeline state the export needs into plain
+        data, so the worker thread never touches Qt objects."""
+        video_clips = []
+        if self._track_is_active(self.video_track):
+            for c in self.video_track.clips:
+                video_clips.append({
+                    'path': c.file_path,
+                    'start_time': float(c.start_time),
+                    'source_start': float(c.source_start),
+                    'duration': float(c.duration),
+                    'speed': float(getattr(c, 'speed', 1.0) or 1.0),
+                    'volume': float(getattr(c, 'volume', 1.0)),
+                    'is_muted': bool(getattr(c, 'is_muted', False)),
+                })
+
+        audio_clips = []
+        for t in self.project.tracks:
+            if t.track_type != 'audio' or not self._track_is_active(t):
+                continue
+            for c in t.clips:
+                if c.file_path and os.path.exists(c.file_path):
+                    audio_clips.append({
+                        'path': c.file_path,
+                        'start': float(c.start_time),
+                        'source_start': float(c.source_start),
+                        'duration': float(c.duration),
+                        'volume': float(getattr(c, 'volume', 1.0)),
+                    })
+
+        overlay_clips = []
+        text_clips = []
+        for t in self.project.tracks:
+            if t.track_type == 'overlay' and self._track_is_active(t):
+                for c in t.clips:
+                    if c.file_path and os.path.exists(c.file_path):
+                        overlay_clips.append({
+                            'path': c.file_path,
+                            'start': float(c.start_time),
+                            'end': float(c.end_time),
+                        })
+            elif t.track_type == 'subtitle' and self._track_is_active(t):
+                for c in t.clips:
+                    txt = getattr(c, 'text', '')
+                    if txt:
+                        text_clips.append({
+                            'text': txt,
+                            'start': float(c.start_time),
+                            'end': float(c.end_time),
+                        })
+
+        effect_vf = ''
+        if hasattr(self, 'effect_stack'):
+            effect_vf = self.effect_stack.to_ffmpeg_vf() or ''
+
+        return {
+            'is_audio_only': is_audio_only,
+            'resolution': self.res_combo.currentText().lower(),
+            # Use the detected hardware encoder — the old code read a config key
+            # that never existed, silently forcing CPU-only libx264 exports.
+            'codec': self.video_editor.settings.get('encoder', 'libx264'),
+            'volume': self.volume_slider.value(),
+            'voice_boost': self.voice_boost_btn.isChecked(),
+            'wm_enabled': self.enable_wm_cb.isChecked(),
+            'wm_rect': (self.wm_x_spin.value(), self.wm_y_spin.value(),
+                        self.wm_w_spin.value(), self.wm_h_spin.value()),
+            'title_enabled': self.enable_text_cb.isChecked(),
+            'title_text': self.text_input.text().strip(),
+            'title_font_size': self.font_size_spin.value(),
+            'title_color': self.font_color_combo.currentText(),
+            'auto_sub': hasattr(self, 'enable_auto_sub_cb') and self.enable_auto_sub_cb.isChecked(),
+            'srt_path': getattr(self, '_current_srt_path', None),
+            'effect_vf': effect_vf,
+            'playhead': self.timeline.get_position(),
+            'video_clips': video_clips,
+            'audio_clips': audio_clips,
+            'overlay_clips': overlay_clips,
+            'text_clips': text_clips,
+        }
 
     def _on_clip_volume_changed(self, val):
         self.clip_volume_val_label.setText(f"{val}%")
@@ -1558,152 +1656,155 @@ class MainWindow(QMainWindow):
             self.drag_clip_mode_btn.setText("🖐️ Move Clip Mode: OFF")
             self.drag_clip_mode_btn.setStyleSheet("")
 
-    def _run_export_sequence(self, source, output_path, active_filters, is_audio_only, volume, voice_boost, resolution, codec, filtered_temp, audio_temp):
+    def _run_export_sequence(self, opts, output_path):
+        """Runs on the FFmpegWorker thread. Reads ONLY the plain-data `opts`
+        snapshot — never live Qt widgets or the live project."""
+        filtered_temp = opts['filtered_temp']
+        audio_temp = opts['audio_temp']
         self._temp_files.extend([filtered_temp, audio_temp])
-        
-        if not self.video_track.clips:
-            raise RuntimeError("No video clips on the timeline")
+
+        video_clips = opts['video_clips']
+        if not video_clips:
+            raise RuntimeError("No video clips to export (is the video track muted?)")
+
+        resolution = opts['resolution']
+        codec = opts['codec']
+        is_audio_only = opts['is_audio_only']
 
         format_ext = Path(output_path).suffix.lower()
         is_image_export = format_ext in ['.png', '.jpg', '.jpeg', '.bmp', '.webp']
 
-        if is_image_export:
-            playhead_time = self.timeline.get_position()
-            active_clip = None
-            for c in self.video_track.clips:
-                if c.start_time <= playhead_time <= c.end_time:
-                    active_clip = c
-                    break
-            if not active_clip and self.video_track.clips:
-                active_clip = self.video_track.clips[0]
+        # Resolve ONE concrete target geometry up front so every rendered piece
+        # (clips AND black gap fillers) matches exactly for lossless concat.
+        # Previously 'Source' resolution made gaps default to 1920x1080@30 while
+        # clips kept their own size/fps — corrupting the concat output.
+        first_info = self.video_editor.get_video_info(video_clips[0]['path'])
+        target_fps = float(first_info.get('fps', 30.0) or 30.0)
+        if resolution in ('source', 'auto', 'original', ''):
+            tw = int(first_info.get('width', 1920) or 1920)
+            th = int(first_info.get('height', 1080) or 1080)
+        else:
+            tw, th = self.video_editor._parse_resolution(resolution)
+        tw -= tw % 2
+        th -= th % 2
+        res_str = f"{tw}x{th}"
 
-            source_time = active_clip.source_start + max(0.0, playhead_time - active_clip.start_time) if active_clip else 0.0
-            input_file = active_clip.file_path if active_clip else source
+        if is_image_export:
+            playhead_time = opts['playhead']
+            active = None
+            for c in video_clips:
+                footprint = c['duration'] / max(0.1, c['speed'])
+                if c['start_time'] <= playhead_time <= c['start_time'] + footprint:
+                    active = c
+                    break
+            if not active:
+                active = video_clips[0]
+
+            source_time = active['source_start'] + max(0.0, (playhead_time - active['start_time'])) * active['speed']
+            input_file = active['path']
 
             img_filters = []
-            if self.enable_wm_cb.isChecked():
-                x = self.wm_x_spin.value()
-                y = self.wm_y_spin.value()
-                w = self.wm_w_spin.value()
-                h = self.wm_h_spin.value()
+            if opts['wm_enabled']:
+                x, y, w, h = opts['wm_rect']
                 info = self.video_editor.get_video_info(input_file)
-                vw = info.get('width', 0)
-                vh = info.get('height', 0)
-                img_filters.append(self.filter_editor.get_delogo_filter_string(x, y, w, h, vw, vh))
+                img_filters.append(self.filter_editor.get_delogo_filter_string(
+                    x, y, w, h, info.get('width', 0), info.get('height', 0)))
+            if opts['effect_vf']:
+                img_filters.append(opts['effect_vf'])
 
-            for f_name, f_val in active_filters:
-                if f_name == 'AI Enhance':
-                    upscale_target = self.ai_upscale_combo.currentText()
-                    fs = self.filter_editor.get_auto_enhance_filter_string(f_val, f_val, f_val, upscale_target)
-                else:
-                    fs = self.filter_editor.get_filter_string(f_name, f_val)
-                if fs:
-                    img_filters.append(fs)
-
-            combined_filter = ",".join(img_filters)
-            self.video_editor.render_image_frame(input_file, output_path, start_time=source_time, filter_str=combined_filter, resolution=resolution)
+            self.video_editor.render_image_frame(
+                input_file, output_path, start_time=source_time,
+                filter_str=",".join(img_filters), resolution=resolution)
             return self._temp_files
 
-        # 1. Render all clips individually and handle gaps
+        # 1. Render all clips individually and fill timeline gaps with black
         rendered_clips = []
         current_timeline_pos = 0.0
-        
-        for i, clip in enumerate(self.video_track.clips):
-            # Check for gap before this clip
-            if clip.start_time > current_timeline_pos + 0.05:
-                gap_duration = clip.start_time - current_timeline_pos
+
+        for i, clip in enumerate(video_clips):
+            if clip['start_time'] > current_timeline_pos + 0.05:
+                gap_duration = clip['start_time'] - current_timeline_pos
                 gap_temp = self._get_output_path(f"gap_{i}", ".mp4", is_temp=True)
                 self._temp_files.append(gap_temp)
-                self.video_editor.generate_black_video(gap_temp, gap_duration, resolution, codec)
+                self.video_editor.generate_black_video(gap_temp, gap_duration, res_str, codec, fps=target_fps)
                 rendered_clips.append(gap_temp)
-                
+
+            # Watermark removal happens HERE, per clip, at the SOURCE resolution —
+            # the rectangle was selected on the original frame, so applying it
+            # after scaling (as before) pointed at the wrong pixels and could
+            # fall outside the frame entirely.
+            clip_extra_vf = ""
+            if opts['wm_enabled']:
+                x, y, w, h = opts['wm_rect']
+                src_info = self.video_editor.get_video_info(clip['path'])
+                clip_extra_vf = self.filter_editor.get_delogo_filter_string(
+                    x, y, w, h, src_info.get('width', 0), src_info.get('height', 0))
+
             clip_temp = self._get_output_path(f"clip_{i}", ".mp4", is_temp=True)
             self._temp_files.append(clip_temp)
             self.video_editor.render_video(
-                clip.file_path,
+                clip['path'],
                 clip_temp,
-                start_time=clip.source_start,
-                end_time=clip.source_start + clip.duration,
-                resolution=resolution,
+                start_time=clip['source_start'],
+                end_time=clip['source_start'] + clip['duration'],
+                resolution=res_str,
+                fps=target_fps,
                 codec=codec,
-                volume=getattr(clip, 'volume', 1.0),
-                is_muted=getattr(clip, 'is_muted', False)
+                speed=clip['speed'],
+                volume=clip['volume'],
+                is_muted=clip['is_muted'],
+                extra_vf=clip_extra_vf
             )
             rendered_clips.append(clip_temp)
-            current_timeline_pos = clip.start_time + clip.duration
-            
-        # 2. Concat if multiple clips
+            # Timeline footprint shrinks/grows with speed
+            current_timeline_pos = clip['start_time'] + clip['duration'] / max(0.1, clip['speed'])
+
+        # 2. Concat if multiple pieces
         if len(rendered_clips) > 1:
             concat_list = self._get_output_path("concat_list", ".txt", is_temp=True)
             self._temp_files.append(concat_list)
-            
-            with open(concat_list, "w") as f:
+
+            with open(concat_list, "w", encoding="utf-8") as f:
                 for rc in rendered_clips:
                     safe_path = os.path.abspath(rc).replace('\\', '/').replace("'", "'\\''")
                     f.write(f"file '{safe_path}'\n")
-            
+
             concatenated_temp = self._get_output_path("concatenated", ".mp4", is_temp=True)
             self._temp_files.append(concatenated_temp)
             self.video_editor.concat_clips(concat_list, concatenated_temp)
             current_source = concatenated_temp
         else:
             current_source = rendered_clips[0]
-        
-        # 3. Filters
+
+        # 3. Single filter pass: color grade → title → timeline text → subtitles
+        # (watermark removal already happened per-clip at source resolution)
         if not is_audio_only:
-            if self.enable_wm_cb.isChecked():
-                x = self.wm_x_spin.value()
-                y = self.wm_y_spin.value()
-                w = self.wm_w_spin.value()
-                h = self.wm_h_spin.value()
-                info = self.video_editor.get_video_info(current_source)
-                vw = info.get('width', 0)
-                vh = info.get('height', 0)
-                delogo_str = self.filter_editor.get_delogo_filter_string(x, y, w, h, vw, vh)
-                active_filters.insert(0, delogo_str)
-
             proc_filters = []
-            ai_mode = getattr(self, 'ai_model_combo', None) and self.ai_model_combo.currentText() or 'real_life'
-            upscale_target = self.ai_upscale_combo.currentText()
 
-            # Pass Unified EffectStack filtergraph directly to Export (Single Pass, Zero Duplication!)
-            if hasattr(self, 'effect_stack'):
-                unified_vf = self.effect_stack.to_ffmpeg_vf()
-                if unified_vf and unified_vf.strip():
-                    proc_filters.append(unified_vf.strip())
-            else:
-                for item in active_filters:
-                    if isinstance(item, tuple) and len(item) == 2:
-                        fn, fv = item
-                        if fn == 'AI Enhance':
-                            fs = self.filter_editor.get_auto_enhance_filter_string(fv, fv, fv, upscale_target, mode=ai_mode)
-                            if fs:
-                                proc_filters.append(fs)
-                        else:
-                            fs = self.filter_editor.get_filter_string(fn, fv)
-                            if fs:
-                                proc_filters.append(fs)
-                    elif isinstance(item, str) and item.strip():
-                        proc_filters.append(item.strip())
+            if opts['effect_vf']:
+                proc_filters.append(opts['effect_vf'])
 
-            if self.enable_text_cb.isChecked() and self.text_input.text().strip():
-                txt = self.text_input.text().strip()
-                fsz = self.font_size_spin.value()
-                col = self.font_color_combo.currentText()
-                dt_str = self.filter_editor.get_drawtext_filter_string(txt, fsz, col)
+            if opts['title_enabled'] and opts['title_text']:
+                dt_str = self.filter_editor.get_drawtext_filter_string(
+                    opts['title_text'], opts['title_font_size'], opts['title_color'])
                 if dt_str:
                     proc_filters.append(dt_str)
-            
-            if hasattr(self, 'enable_auto_sub_cb') and self.enable_auto_sub_cb.isChecked():
-                srt_p = getattr(self, '_current_srt_path', None)
+
+            # Timeline text clips (titles/captions on the subtitle track) are now
+            # burned into the export with their real timing windows.
+            for tc in opts['text_clips']:
+                dt = self.filter_editor.get_drawtext_filter_string(tc['text'], 30, 'white')
+                if dt:
+                    proc_filters.append(f"{dt}:enable='between(t,{tc['start']:.3f},{tc['end']:.3f})'")
+
+            if opts['auto_sub']:
+                srt_p = opts['srt_path']
                 if not srt_p or not os.path.exists(srt_p):
                     from utils.speech_engine import SpeechToTextEngine
                     engine = SpeechToTextEngine(self.video_editor.ffmpeg.ffmpeg_path)
                     srt_p = self._get_output_path("captions", ".srt", is_temp=True)
                     engine.generate_subtitles(current_source, srt_p)
-                    self._current_srt_path = srt_p
-                
-                sub_filter = self.filter_editor.get_subtitles_filter_string(srt_p)
+                sub_filter = self.filter_editor.get_subtitle_filter_string(srt_p)
                 if sub_filter:
                     proc_filters.append(sub_filter)
 
@@ -1711,36 +1812,57 @@ class MainWindow(QMainWindow):
                 combined_filter = ",".join(proc_filters)
                 self.video_editor.apply_filter(current_source, filtered_temp, combined_filter, resolution)
                 current_source = filtered_temp
-            
-        # 4. Mix Audio Track Music Clips
-        if hasattr(self, 'audio_track') and self.audio_track and self.audio_track.clips:
-            aud_clip = self.audio_track.clips[0]
-            if os.path.exists(aud_clip.file_path):
+
+            # 3b. Composite image/PiP overlay clips (needs extra inputs → own pass).
+            # These previously showed in the preview but never exported at all.
+            if opts['overlay_clips']:
+                overlay_temp = self._get_output_path("overlaid", ".mp4", is_temp=True)
+                self._temp_files.append(overlay_temp)
+                cmd = self.video_editor.ffmpeg.build_overlay_pass(
+                    current_source, opts['overlay_clips'], overlay_temp, tw, th)
+                self.video_editor._execute(cmd)
+                current_source = overlay_temp
+
+        # 4. Mix ALL audio-track clips at their true timeline positions.
+        # The old code mixed only the first clip, always starting at 0:00.
+        if opts['audio_clips'] and not is_audio_only:
+            mixed_temp = self._get_output_path("audio_mixed", ".mp4", is_temp=True)
+            self._temp_files.append(mixed_temp)
+            cmd = self.video_editor.ffmpeg.build_audio_mix_timeline(
+                current_source, opts['audio_clips'], mixed_temp)
+            self.video_editor._execute(cmd)
+            current_source = mixed_temp
+
+        # 5. Master audio adjustments / delivery
+        volume = opts['volume']
+        if is_audio_only:
+            if opts['audio_clips']:
                 mixed_temp = self._get_output_path("audio_mixed", ".mp4", is_temp=True)
                 self._temp_files.append(mixed_temp)
-                aud_vol = getattr(aud_clip, 'volume', 1.0)
-                self.audio_editor.mix_audio(current_source, aud_clip.file_path, mixed_temp, volume=aud_vol)
+                cmd = self.video_editor.ffmpeg.build_audio_mix_timeline(
+                    current_source, opts['audio_clips'], mixed_temp)
+                self.video_editor._execute(cmd)
                 current_source = mixed_temp
-
-        # 5. Audio Adjustments
-        if is_audio_only:
-            self.audio_editor.extract_audio(current_source, output_path)
             if volume != 100:
-                vol_gain = volume / 100.0
-                self.audio_editor.adjust_volume(output_path, output_path, vol_gain)
+                # Never read+write the same file in one FFmpeg call (it corrupts output)
+                tmp_mp3 = self._get_output_path("audio_only", ".mp3", is_temp=True)
+                self._temp_files.append(tmp_mp3)
+                self.audio_editor.extract_audio(current_source, tmp_mp3)
+                self.audio_editor.adjust_volume(tmp_mp3, output_path, volume / 100.0)
+            else:
+                self.audio_editor.extract_audio(current_source, output_path)
         else:
-            if volume != 100 or voice_boost:
-                vol_gain = volume / 100.0
-                if voice_boost:
+            if volume != 100 or opts['voice_boost']:
+                if opts['voice_boost']:
                     self.audio_editor.voice_boost(current_source, audio_temp, voice_gain=6.0, music_gain=0.5)
                     current_source = audio_temp
                 elif volume != 100:
-                    self.audio_editor.adjust_volume(current_source, audio_temp, vol_gain)
+                    self.audio_editor.adjust_volume(current_source, audio_temp, volume / 100.0)
                     current_source = audio_temp
 
             import shutil
             shutil.copyfile(current_source, output_path)
-            
+
         return self._temp_files
 
     def _get_output_path(self, suffix: str, ext: str = ".mp4", is_temp: bool = True) -> str:
@@ -1816,9 +1938,9 @@ class MainWindow(QMainWindow):
         self.update_time_label()
 
     def _sync_media_player(self, timeline_time, force_seek=False):
-        # 1. Image / PiP Overlay Layer Lookup
+        # 1. Image / PiP Overlay Layer Lookup (honors track mute/solo)
         active_overlay_clip = None
-        if hasattr(self, 'overlay_track') and self.overlay_track and self.overlay_track.clips:
+        if getattr(self, 'overlay_track', None) is not None and self.overlay_track.clips and self._track_is_active(self.overlay_track):
             for c in self.overlay_track.clips:
                 if c.start_time <= timeline_time < c.end_time:
                     active_overlay_clip = c
@@ -1829,17 +1951,17 @@ class MainWindow(QMainWindow):
         else:
             self.canvas_frame.set_image_overlay(None, False)
 
-        # 2. Main Video Layer Lookup
+        # 2. Main Video Layer Lookup (speed-aware: timeline footprint = duration / speed)
         active_video_clip = None
-        if self.video_track and self.video_track.clips:
+        if self.video_track and self.video_track.clips and self._track_is_active(self.video_track):
             for clip in self.video_track.clips:
-                if clip.start_time <= timeline_time < (clip.start_time + clip.duration):
+                if clip.start_time <= timeline_time < clip.end_time:
                     active_video_clip = clip
                     break
-                    
+
             if not active_video_clip and timeline_time >= self.project.get_duration():
                 active_video_clip = self.video_track.clips[-1]
-                timeline_time = active_video_clip.start_time + active_video_clip.duration - 0.001
+                timeline_time = active_video_clip.end_time - 0.001
 
         last_clip = getattr(self, '_last_active_clip', None)
         if active_video_clip is not last_clip:
@@ -1847,28 +1969,36 @@ class MainWindow(QMainWindow):
             self._last_active_clip = active_video_clip
 
         if active_video_clip:
-            target_media_time = active_video_clip.source_start + (timeline_time - active_video_clip.start_time)
-            
+            speed = max(0.1, float(getattr(active_video_clip, 'speed', 1.0) or 1.0))
+            target_media_time = active_video_clip.source_start + (timeline_time - active_video_clip.start_time) * speed
+
             abs_path = os.path.abspath(active_video_clip.file_path)
-            if self.current_file != abs_path:
+            # Preview plays through the 540p proxy when ready (export uses the original)
+            play_path = self.proxy_engine.get_preview_path(abs_path) if hasattr(self, 'proxy_engine') else abs_path
+            if getattr(self, '_current_video_source', None) != play_path:
+                self._current_video_source = play_path
                 self.current_file = abs_path
-                self.media_player.setSource(QUrl.fromLocalFile(abs_path))
-            
+                self.media_player.setSource(QUrl.fromLocalFile(play_path))
+                force_seek = True
+
+            if abs(self.media_player.playbackRate() - speed) > 0.01:
+                self.media_player.setPlaybackRate(speed)
+
             current_pos = self.media_player.position() / 1000.0
             if force_seek or abs(current_pos - target_media_time) > 1.0:
                 self.media_player.setPosition(int(target_media_time * 1000))
-                
+
             if self.playback_timer.isActive() and self.media_player.playbackState() != QMediaPlayer.PlayingState:
                 self.media_player.play()
         else:
             if self.media_player.playbackState() == QMediaPlayer.PlayingState:
                 self.media_player.pause()
 
-        # 2b. Audio Track Live Preview Lookup
+        # 2b. Audio Track Live Preview Lookup (honors track mute/solo)
         active_audio_clip = None
-        if hasattr(self, 'audio_track') and self.audio_track and self.audio_track.clips:
+        if getattr(self, 'audio_track', None) is not None and self.audio_track.clips and self._track_is_active(self.audio_track):
             for clip in self.audio_track.clips:
-                if clip.start_time <= timeline_time < (clip.start_time + clip.duration):
+                if clip.start_time <= timeline_time < clip.end_time:
                     active_audio_clip = clip
                     break
 
@@ -1904,16 +2034,18 @@ class MainWindow(QMainWindow):
         active_clip = getattr(self, '_last_active_clip', None)
         
         if active_clip and self.media_player.playbackState() == QMediaPlayer.PlayingState:
+            speed = max(0.1, float(getattr(active_clip, 'speed', 1.0) or 1.0))
             current_media_time = self.media_player.position() / 1000.0
             clip_progress = current_media_time - active_clip.source_start
-            
+
             if clip_progress < 0:
                 clip_progress = 0
-                
-            new_time = active_clip.start_time + clip_progress
-            
+
+            # Media time advances at `speed`× — divide to get timeline progress
+            new_time = active_clip.start_time + clip_progress / speed
+
             if clip_progress >= active_clip.duration:
-                new_time = active_clip.start_time + active_clip.duration
+                new_time = active_clip.end_time
                 self.timeline.set_position(new_time)
                 self._sync_media_player(new_time, force_seek=True)
             else:
